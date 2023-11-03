@@ -17,76 +17,131 @@ class ClientServer:
         self.rate = 0
         self._dispatcher = Dispatcher()
         self._dispatcher.map("/rate", self.__rate_handler)
+        self._dispatcher.map("/index", self.__index_handler)
+        self._dispatcher.map("/step", self.__step_handler)
+        self.index = 0
+        self.step = 1
 
     def __rate_handler(self, address, *args):
         # Modified from https://python-osc.readthedocs.io/en/latest/dispatcher.html
         if not len(args) == 1 or not address=="/rate" or (type(args[0]) is not int and type(args[0]) is not float):
             return
-        self.rate = args[0]
+        self.rate = max(args[0], 0)
+
+    def __index_handler(self, address, *args):
+        if not len(args) == 1 or not address=="/index" or (type(args[0]) is not int and type(args[0]) is not float):
+            return
+        elif args[0] < 0 or args[0] >= len(self.df):
+            print(f"Index must be in the range [0, {len(self.df) - 1}]")
+        elif args[0] < 1:
+            self.index = args[0] * (len(self.df) - 1)
+        else: 
+            self.index = args[0]
+
+    def __step_handler(self, address, *args):
+        if not len(args) == 1 or not address=="/step" or (type(args[0]) is not int and type(args[0]) is not float):
+            return
+        self.step = args[0]
+
+    # async def __send_loop (self, columns, client):
+        """
+            old implementation for reference
+        """
+    #     for _, row in self.df.iloc[:].iterrows():
+    #         for col in columns:
+    #             client.send_message(f"/{col}", row[col])
+    #         while self.rate == 0: await asyncio.sleep(.001)
+    #         await asyncio.sleep(1/self.rate)
+
+    #     await self.__send_loop(columns, client)
+
+    # async def __send_loop_timed(self, columns, time_col, client, format):
+        """
+            old implementation for reference
+        """
+    #     last_time = datetime.datetime.strptime(self.df[time_col].values[0], format)
+    #     for _, row in self.df.iloc[:].iterrows():
+    #         curr_time = datetime.datetime.strptime(row[time_col] + "000", format) # 000 may not be necessary see datetime docs
+    #         while self.rate == 0: await asyncio.sleep(.001)
+    #         await asyncio.sleep(((curr_time - last_time).total_seconds())/self.rate) # figure out what rate means here like mathematicaly
+    #         last_time = curr_time
+
+    #         for col in columns:
+    #             client.send_message(f"/{col}", row[col])
+
+    
+    async def __send_items(self, columns, client):
+        """
+            Functional version of __send_loop()
+        """
+        for col in columns:
+            client.send_message(f"/{col}", self.df.iloc[[self.index]][col])
+        while self.rate == 0: await asyncio.sleep(.001)
+        await asyncio.sleep(1/self.rate)
+        self.index = (self.step + self.index) % len(self.df)
+
+    async def __send_items_timed(self, columns, time_col, client, format, last_time):
+        """
+            Functinal version of __send_loop_timed()
+        """
+        curr_time = datetime.datetime.strptime(self.df.iloc[[self.index]][time_col].iat[0] + "000", format) # 000 may not be necessary see datetime docs
+        for col in columns:
+            client.send_message(f"/{col}", self.df.iloc[[self.index]][col])
+        while self.rate == 0: await asyncio.sleep(.001)
+        await asyncio.sleep(((curr_time - last_time).total_seconds())/self.rate) # figure out what rate means here like mathematicaly
+        self.index = (self.step + self.index) % len(self.df)
+        return curr_time
 
 
-    async def __send_loop (self, columns, client):
-        for _, row in self.df.iterrows():
-            for col in columns:
-                client.send_message(f"/{col}", row[col])
-            while self.rate == 0: await asyncio.sleep(.001)
-            await asyncio.sleep(1/self.rate)
-
-    async def __send_loop_timed(self, columns, time_col, client, format):
-        last_time = datetime.datetime.strptime(self.df[time_col].values[0], format)
-        for _, row in self.df.iterrows():
-            curr_time = datetime.datetime.strptime(row[time_col] + "000", format) # 000 may not be necessary see datetime docs
-            while self.rate == 0: await asyncio.sleep(.001)
-            await asyncio.sleep(((curr_time - last_time).total_seconds())/self.rate) # figure out what rate means here like mathematicaly
-            last_time = curr_time
-
-            for col in columns:
-                client.send_message(f"/{col}", row[col])
-
-    async def send_by_rate(self, port, columns, rate_init, rate_port):
+    async def send_by_rate(self, send_port, columns, rate_init, receive_port):
         '''
-            port: int
+            send_port: int
             columns: array of strings
             rate_init: int (number of rows per second)
-            rate_port: int
+            receive_port: int
 
         '''
 
-        client = SimpleUDPClient(self._ip, port)
+        client = SimpleUDPClient(self._ip, send_port)
         self.rate = rate_init
 
-        if rate_port is None:
-            await self.__send_loop(columns, client)
-        else:
-            server = AsyncIOOSCUDPServer((self._ip, rate_port), self._dispatcher, asyncio.get_event_loop())
+        if receive_port is not None:
+            server = AsyncIOOSCUDPServer((self._ip, receive_port), self._dispatcher, asyncio.get_event_loop())
             transport, _ = await server.create_serve_endpoint()  # Create datagram endpoint and start serving
 
-            await self.__send_loop(columns, client)  # Enter main loop of program
+        try: 
+            while True:
+                await self.__send_items(columns, client)
+        except:
+            try: transport.close()  # Clean up serve endpoint
+            except: pass
 
-            transport.close()  # Clean up serve endpoint
-
-    async def send_by_time(self, port, columns, rate_init, rate_port, time_col, format):
+    async def send_by_time(self, send_port, columns, rate_init, receive_port, time_col, format):
         """
-            port: int
+            send_port: int
             columns: array of strings
             rate_init: int 
-            rate_port: int
+            receive_port: int
             time_col: string
             format: string
 
         """
-        client = SimpleUDPClient(self._ip, port)
+        client = SimpleUDPClient(self._ip, send_port)
+
         self.rate = rate_init
 
-        if rate_port is None:
-            await self.__send_loop_timed(columns, time_col, client, format)  # Enter main loop of program
-        else:
-            server = AsyncIOOSCUDPServer((self._ip, rate_port), self._dispatcher, asyncio.get_event_loop())
+        if receive_port is not None:
+            server = AsyncIOOSCUDPServer((self._ip, receive_port), self._dispatcher, asyncio.get_event_loop())
             transport, _ = await server.create_serve_endpoint()  # Create datagram endpoint and start serving
 
-            await self.__send_loop_timed(columns, time_col, client, format)  # Enter main loop of program
+        last_time = datetime.datetime.strptime(self.df[time_col].values[self.index], format) 
 
-            transport.close()  # Clean up serve endpoint 
+        try: 
+            while True:
+                last_time = await self.__send_items_timed(columns, time_col, client, format, last_time)
+        except:
+            try: transport.close()  # Clean up serve endpoint 
+            except: return
         
 
 # test
@@ -99,3 +154,8 @@ format = "%Y-%m-%d %H:%M:%S.%f"
 # asyncio.run(cl.send_by_rate(8888, ["latitude", "longitude"], 3, 7777))
 
 asyncio.run(cl.send_by_time(8888, ["latitude"], 10000, 7777, "origin_time", format))
+
+# cl =  ClientServer("127.0.0.1", "customers-100.csv") 
+# print(cl.df.columns)
+# asyncio.run(cl.send_by_rate(8888, ["Index"], 3, 7777))
+
